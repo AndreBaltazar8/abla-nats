@@ -248,14 +248,16 @@ fun natsClient(config: NatsConfig): NatsClient {
     val identity = natsNextClientIdentity
     natsNextClientIdentity = natsNextClientIdentity + 1
     val prefix = "_INBOX.abla.${linuxProcessId()}.$identity"
+    var connection = TcpConnection(-1)
     NatsClient(
-        config, NatsStream(TcpConnection(-1), ""), false, 1, 1, prefix
+        config, NatsStream(move(connection), ""), false, 1, 1, prefix
     )
 }
 
 fun NatsClient.disconnect(): void {
     if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
-    this.stream = NatsStream(TcpConnection(-1), "")
+    var connection = TcpConnection(-1)
+    this.stream = NatsStream(move(connection), "")
     this.ready = false
     return
 }
@@ -293,11 +295,11 @@ fun NatsClient.connectPayload(): string {
 fun NatsClient.connect(): NatsMessage {
     if (this.ready) return natsMessage("ok")
     val address = natsResolveIpv4(this.config.host)
-    val connection = tcpConnectIpv4(
+    var connection = tcpConnectIpv4(
         address, this.config.port, this.config.connectTimeoutMilliseconds
     )
     if (connection.descriptor < 0) return natsFailure("Could not connect to NATS")
-    this.stream = NatsStream(connection, "")
+    this.stream = NatsStream(move(connection), "")
     val information = this.stream.next(this.config.readTimeoutMilliseconds)
     if (information.kind != "info") {
         this.disconnect()

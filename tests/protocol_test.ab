@@ -1,7 +1,8 @@
 import "../src/nats.ab"
 
 fun main: int {
-    val stream = NatsStream(TcpConnection(-1), "INFO {\"server_id\":\"test\"}\r\nPING\r\nMSG events 7 reply.inbox 5\r\nhello\r\nHMSG headers 8 12 16\r\nNATS/1.0\r\n\r\ndata\r\n")
+    var connection = TcpConnection(-1)
+    val stream = NatsStream(move(connection), "INFO {\"server_id\":\"test\"}\r\nPING\r\nMSG events 7 reply.inbox 5\r\nhello\r\nHMSG headers 8 12 16\r\nNATS/1.0\r\n\r\ndata\r\n")
     val information = stream.next(1)
     val ping = stream.next(1)
     val message = stream.next(1)
