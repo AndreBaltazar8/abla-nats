@@ -1,0 +1,420 @@
+// Core NATS protocol client for Abla Linux services.
+
+import "abla/json"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+class NatsConfig(
+    val host: string,
+    val port: int = 4222,
+    val name: string = "abla",
+    val token: string = "",
+    val username: string = "",
+    val password: string = "",
+    val connectTimeoutMilliseconds: int = 3000,
+    val readTimeoutMilliseconds: int = 5000
+)
+
+class NatsMessage(
+    val kind: string,
+    val subject: string,
+    val reply: string,
+    val payload: string,
+    val headers: string,
+    val sid: int,
+    val error: string
+) {
+    fun succeeded(): bool = this.error == ""
+}
+
+class NatsLine(val text: string, val valid: bool)
+
+class NatsStream(val connection: TcpConnection, var buffered: string)
+
+class NatsClient(
+    val config: NatsConfig,
+    var stream: NatsStream,
+    var ready: bool,
+    var nextSid: int,
+    var nextInbox: int,
+    val inboxPrefix: string
+)
+
+var natsNextClientIdentity: int = 1
+
+fun natsMessage(
+    kind: string,
+    subject: string = "",
+    reply: string = "",
+    payload: string = "",
+    headers: string = "",
+    sid: int = 0,
+    error: string = ""
+): NatsMessage = NatsMessage(
+    kind, subject, reply, payload, headers, sid, error
+)
+
+fun natsFailure(message: string): NatsMessage =
+    natsMessage("transport", "", "", "", "", 0, message)
+
+fun natsParseInt(value: string, fallback: int = 0): int {
+    var result = 0
+    var valid = value.size > 0
+    var index = 0
+    while (valid && index < value.size) {
+        val digit = value[index] - 48
+        if (digit < 0 || digit > 9) valid = false
+        else result = result * 10 + digit
+        index = index + 1
+    }
+    if (valid) result else fallback
+}
+
+fun natsWords(value: string): array<string> {
+    val words: array<string> = []
+    var index = 0
+    while (index < value.size) {
+        while (index < value.size && value[index] == 32) index = index + 1
+        val begin = index
+        while (index < value.size && value[index] != 32) index = index + 1
+        if (begin < index) words.append(value.slice(begin, index))
+    }
+    words
+}
+
+fun natsSubjectValid(subject: string, wildcards: bool): bool {
+    var valid = subject.size > 0 && subject.size <= 1024 &&
+        subject[0] != 46 && subject[subject.size - 1] != 46
+    var index = 0
+    while (valid && index < subject.size) {
+        val byte = subject[index]
+        if (byte <= 32 || byte == 127) valid = false
+        else if (byte == 46 && (index == 0 || subject[index - 1] == 46)) {
+            valid = false
+        } else if (byte == 42 || byte == 62) {
+            val tokenBegin = index == 0 || subject[index - 1] == 46
+            val tokenEnd = index + 1 == subject.size || subject[index + 1] == 46
+            if (!wildcards || !tokenBegin || !tokenEnd ||
+                (byte == 62 && index + 1 != subject.size)) valid = false
+        }
+        index = index + 1
+    }
+    valid
+}
+
+fun natsEnvironment(name: string, fallback: string): string {
+    val configured = linuxEnvironment(name)
+    if (configured.found && configured.value != "") configured.value else fallback
+}
+
+fun natsSecret(name: string, fileName: string): string {
+    val direct = linuxEnvironment(name)
+    var result = ""
+    if (direct.found) result = direct.value
+    else {
+        val configuredFile = linuxEnvironment(fileName)
+        if (configuredFile.found && configuredFile.value != "") {
+            val contents = linuxReadFile(configuredFile.value, 65536)
+            var end = contents.size
+            while (end > 0 && (contents[end - 1] == 10 ||
+                contents[end - 1] == 13)) end = end - 1
+            if (end > 0) result = contents.slice(0, end)
+        }
+    }
+    result
+}
+
+fun natsConfigFromEnvironment(): NatsConfig = NatsConfig(
+    natsEnvironment("NATS_HOST", "127.0.0.1"),
+    natsParseInt(natsEnvironment("NATS_PORT", "4222"), 4222),
+    natsEnvironment("NATS_NAME", "abla"),
+    natsSecret("NATS_TOKEN", "NATS_TOKEN_FILE"),
+    natsEnvironment("NATS_USERNAME", ""),
+    natsSecret("NATS_PASSWORD", "NATS_PASSWORD_FILE"),
+    natsParseInt(natsEnvironment("NATS_CONNECT_TIMEOUT_MS", "3000"), 3000),
+    natsParseInt(natsEnvironment("NATS_READ_TIMEOUT_MS", "5000"), 5000)
+)
+
+fun natsResolveIpv4(host: string): string {
+    val parsed = linuxIpv4Octets(host)
+    var result = host
+    if (parsed.size != 4) {
+        val command = linuxCommand("getent")
+        command.argument("ahostsv4")
+        command.argument(host)
+        val lookup = command.capture()
+        result = ""
+        if (lookup.status == 0) {
+            var end = 0
+            while (end < lookup.output.size && lookup.output[end] != 32 &&
+                lookup.output[end] != 9 && lookup.output[end] != 10) {
+                end = end + 1
+            }
+            if (end > 0) result = lookup.output.slice(0, end)
+        }
+    }
+    result
+}
+
+fun NatsStream.ensure(count: int, timeoutMilliseconds: int): bool {
+    var attempts = 0
+    while (this.buffered.size < count && attempts < 20) {
+        val slice = if (timeoutMilliseconds < 250) timeoutMilliseconds else 250
+        val chunk = this.connection.readWithTimeout(1048576, slice)
+        if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
+        attempts = attempts + 1
+    }
+    this.buffered.size >= count
+}
+
+fun NatsStream.line(timeoutMilliseconds: int): NatsLine {
+    var end = -1
+    var attempts = 0
+    while (end < 0 && attempts < 20) {
+        var index = 0
+        while (end < 0 && index + 1 < this.buffered.size) {
+            if (this.buffered[index] == 13 &&
+                this.buffered[index + 1] == 10) end = index
+            index = index + 1
+        }
+        if (end < 0) {
+            val slice = if (timeoutMilliseconds < 250)
+                timeoutMilliseconds else 250
+            val chunk = this.connection.readWithTimeout(1048576, slice)
+            if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
+            attempts = attempts + 1
+        }
+    }
+    var result = NatsLine("", false)
+    if (end >= 0) {
+        result = NatsLine(this.buffered.slice(0, end), true)
+        this.buffered = this.buffered.slice(end + 2, this.buffered.size)
+    }
+    result
+}
+
+fun NatsStream.next(timeoutMilliseconds: int): NatsMessage {
+    val line = this.line(timeoutMilliseconds)
+    if (!line.valid) return natsFailure("Timed out while reading NATS protocol line")
+    val words = natsWords(line.text)
+    if (words.size == 0) return natsFailure("NATS sent an empty protocol line")
+    if (words[0] == "PING") return natsMessage("ping")
+    if (words[0] == "PONG") return natsMessage("pong")
+    if (words[0] == "+OK") return natsMessage("ok")
+    if (words[0] == "INFO") return natsMessage("info", "", "", line.text)
+    if (words[0] == "-ERR") {
+        var message = line.text
+        if (message.size > 5) message = message.slice(5, message.size)
+        return natsMessage("error", "", "", "", "", 0, message)
+    }
+    if (words[0] == "MSG" && (words.size == 4 || words.size == 5)) {
+        val hasReply = words.size == 5
+        val count = natsParseInt(words[words.size - 1], -1)
+        if (count < 0 || count > 16777216 ||
+            !this.ensure(count + 2, timeoutMilliseconds) ||
+            this.buffered[count] != 13 || this.buffered[count + 1] != 10) {
+            return natsFailure("NATS message payload is invalid or incomplete")
+        }
+        val payload = this.buffered.slice(0, count)
+        this.buffered = this.buffered.slice(count + 2, this.buffered.size)
+        return natsMessage(
+            "message", words[1], if (hasReply) words[3] else "", payload,
+            "", natsParseInt(words[2])
+        )
+    }
+    if (words[0] == "HMSG" && (words.size == 5 || words.size == 6)) {
+        val hasReply = words.size == 6
+        val headerCount = natsParseInt(words[words.size - 2], -1)
+        val totalCount = natsParseInt(words[words.size - 1], -1)
+        if (headerCount < 0 || totalCount < headerCount ||
+            totalCount > 16777216 ||
+            !this.ensure(totalCount + 2, timeoutMilliseconds) ||
+            this.buffered[totalCount] != 13 ||
+            this.buffered[totalCount + 1] != 10) {
+            return natsFailure("NATS header message is invalid or incomplete")
+        }
+        val headers = this.buffered.slice(0, headerCount)
+        val payload = this.buffered.slice(headerCount, totalCount)
+        this.buffered = this.buffered.slice(totalCount + 2, this.buffered.size)
+        return natsMessage(
+            "message", words[1], if (hasReply) words[3] else "", payload,
+            headers, natsParseInt(words[2])
+        )
+    }
+    natsFailure("NATS sent an unsupported protocol operation")
+}
+
+fun natsClient(config: NatsConfig): NatsClient {
+    val identity = natsNextClientIdentity
+    natsNextClientIdentity = natsNextClientIdentity + 1
+    val prefix = "_INBOX.abla.${linuxProcessId()}.$identity"
+    NatsClient(
+        config, NatsStream(TcpConnection(-1), ""), false, 1, 1, prefix
+    )
+}
+
+fun NatsClient.disconnect(): void {
+    if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
+    this.stream = NatsStream(TcpConnection(-1), "")
+    this.ready = false
+    return
+}
+
+fun NatsClient.write(value: string): bool {
+    val written = this.stream.connection.write(value)
+    if (written != value.size) this.disconnect()
+    written == value.size
+}
+
+fun NatsClient.connectPayload(): string {
+    val keys: array<string> = [
+        "verbose", "pedantic", "name", "lang", "version", "protocol", "echo"
+    ]
+    val values: array<Json> = [
+        jsonBoolean(false), jsonBoolean(true), jsonString(this.config.name),
+        jsonString("abla"), jsonString("0.1.0"), jsonInteger(1),
+        jsonBoolean(true)
+    ]
+    if (this.config.token != "") {
+        keys.append("auth_token")
+        values.append(jsonString(this.config.token))
+    }
+    if (this.config.username != "") {
+        keys.append("user")
+        values.append(jsonString(this.config.username))
+    }
+    if (this.config.password != "") {
+        keys.append("pass")
+        values.append(jsonString(this.config.password))
+    }
+    jsonStringify(jsonObject(keys, values))
+}
+
+fun NatsClient.connect(): NatsMessage {
+    if (this.ready) return natsMessage("ok")
+    val address = natsResolveIpv4(this.config.host)
+    val connection = tcpConnectIpv4(
+        address, this.config.port, this.config.connectTimeoutMilliseconds
+    )
+    if (connection.descriptor < 0) return natsFailure("Could not connect to NATS")
+    this.stream = NatsStream(connection, "")
+    val information = this.stream.next(this.config.readTimeoutMilliseconds)
+    if (information.kind != "info") {
+        this.disconnect()
+        return natsFailure("NATS did not begin with an INFO operation")
+    }
+    val payload = this.connectPayload()
+    if (!this.write("CONNECT $payload\r\nPING\r\n")) {
+        return natsFailure("Could not write NATS CONNECT operation")
+    }
+    var complete = false
+    var attempts = 0
+    var error = ""
+    while (!complete && error == "" && attempts < 20) {
+        val event = this.stream.next(this.config.readTimeoutMilliseconds)
+        if (event.kind == "ping") this.write("PONG\r\n")
+        else if (event.kind == "pong") complete = true
+        else if (event.error != "") error = event.error
+        attempts = attempts + 1
+    }
+    this.ready = complete && error == ""
+    if (!this.ready) {
+        this.disconnect()
+        return natsFailure(if (error != "") error else "NATS CONNECT timed out")
+    }
+    natsMessage("ok")
+}
+
+fun NatsClient.publish(
+    subject: string,
+    payload: string,
+    reply: string = ""
+): NatsMessage {
+    var result = this.connect()
+    if (!result.succeeded()) return result
+    if (!natsSubjectValid(subject, false) ||
+        (reply != "" && !natsSubjectValid(reply, false)) ||
+        payload.size > 16777216) {
+        return natsFailure("NATS publish subject, reply, or payload is invalid")
+    }
+    var command = "PUB $subject"
+    if (reply != "") command = "$command $reply"
+    command = "$command ${payload.size}\r\n$payload\r\n"
+    if (!this.write(command)) result = natsFailure("Could not publish NATS message")
+    result
+}
+
+fun NatsClient.subscribe(subject: string, queue: string = ""): int {
+    var sid = 0
+    val connected = this.connect()
+    if (connected.succeeded() && natsSubjectValid(subject, true) &&
+        (queue == "" || natsSubjectValid(queue, false))) {
+        sid = this.nextSid
+        this.nextSid = this.nextSid + 1
+        var command = "SUB $subject"
+        if (queue != "") command = "$command $queue"
+        if (!this.write("$command $sid\r\n")) sid = 0
+    }
+    sid
+}
+
+fun NatsClient.unsubscribe(sid: int, maximum: int = 0): bool {
+    var command = "UNSUB $sid"
+    if (maximum > 0) command = "$command $maximum"
+    sid > 0 && this.ready && this.write("$command\r\n")
+}
+
+fun NatsClient.nextMessage(): NatsMessage {
+    val connected = this.connect()
+    if (!connected.succeeded()) return connected
+    var result = natsFailure("Timed out while waiting for a NATS message")
+    var complete = false
+    var attempts = 0
+    while (!complete && attempts < 100) {
+        val event = this.stream.next(this.config.readTimeoutMilliseconds)
+        if (event.kind == "ping") this.write("PONG\r\n")
+        else if (event.kind == "message" || event.error != "") {
+            result = event
+            complete = true
+        }
+        attempts = attempts + 1
+    }
+    if (result.kind == "transport") this.disconnect()
+    result
+}
+
+fun NatsClient.flush(): NatsMessage {
+    val connected = this.connect()
+    if (!connected.succeeded()) return connected
+    if (!this.write("PING\r\n")) return natsFailure("Could not flush NATS")
+    var result = natsFailure("NATS flush timed out")
+    var complete = false
+    var attempts = 0
+    while (!complete && attempts < 20) {
+        val event = this.stream.next(this.config.readTimeoutMilliseconds)
+        if (event.kind == "ping") this.write("PONG\r\n")
+        else if (event.kind == "pong") {
+            result = natsMessage("pong")
+            complete = true
+        } else if (event.error != "") {
+            result = event
+            complete = true
+        }
+        attempts = attempts + 1
+    }
+    result
+}
+
+fun NatsClient.request(subject: string, payload: string): NatsMessage {
+    val inbox = "${this.inboxPrefix}.${this.nextInbox}"
+    this.nextInbox = this.nextInbox + 1
+    val sid = this.subscribe(inbox)
+    if (sid <= 0) return natsFailure("Could not subscribe to NATS request inbox")
+    this.unsubscribe(sid, 1)
+    val published = this.publish(subject, payload, inbox)
+    var result = published
+    if (published.succeeded()) result = this.nextMessage()
+    result
+}
+
+fun NatsClient.close(): void = this.disconnect()

@@ -1,0 +1,34 @@
+import "../src/nats.ab"
+
+fun main: int {
+    val config = natsConfigFromEnvironment()
+    val subscriber = natsClient(config)
+    val publisher = natsClient(config)
+    val eventsSid = subscriber.subscribe("events.abla")
+    val published = publisher.publish("events.abla", "hello from Abla")
+    val flushed = publisher.flush()
+    val event = subscriber.nextMessage()
+
+    val requestsSid = subscriber.subscribe("service.echo")
+    val inboxSid = publisher.subscribe("_INBOX.integration")
+    val requested = publisher.publish(
+        "service.echo", "request payload", "_INBOX.integration"
+    )
+    val request = subscriber.nextMessage()
+    val replied = subscriber.publish(request.reply, "reply:${request.payload}")
+    val reply = publisher.nextMessage()
+
+    subscriber.unsubscribe(eventsSid)
+    subscriber.unsubscribe(requestsSid)
+    publisher.unsubscribe(inboxSid)
+    subscriber.close()
+    publisher.close()
+
+    if (eventsSid <= 0 || requestsSid <= 0 || inboxSid <= 0) 10
+    else if (!published.succeeded() || !flushed.succeeded()) 20
+    else if (!event.succeeded() || event.payload != "hello from Abla") 30
+    else if (!requested.succeeded() || request.reply != "_INBOX.integration") 40
+    else if (request.payload != "request payload" || !replied.succeeded()) 50
+    else if (!reply.succeeded() || reply.payload != "reply:request payload") 60
+    else 0
+}

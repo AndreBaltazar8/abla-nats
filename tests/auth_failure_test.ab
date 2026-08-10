@@ -1,0 +1,8 @@
+import "../src/nats.ab"
+
+fun main: int {
+    val client = natsClient(natsConfigFromEnvironment())
+    val result = client.connect()
+    client.close()
+    if (!result.succeeded() && result.error != "") 0 else 1
+}
