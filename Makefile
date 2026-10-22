@@ -9,4 +9,5 @@ check:
 	build/protocol-test
 
 test: check
-	./tools/test-nats.sh
+	ABLAC=$(COMPILER) ./tools/test-nats.sh
+	ABLAC=$(COMPILER) ./tools/test-async.sh

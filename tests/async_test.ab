@@ -1,0 +1,66 @@
+// natsAsyncClient against a real server (tools/test-async.sh): publishes
+// buffered before the connection opens, subscriptions made before it opens,
+// a queue-less fan-out, delivery limits and request/reply.
+
+import "abla/sys/linux/process"
+import "../src/async.ab"
+
+fun natsTestOptions(): NatsAsyncOptions {
+    val port = linuxEnvironment("NATS_PORT")
+    NatsAsyncOptions(["nats://127.0.0.1:${if (port.found) port.value else "4222"}"], "async-test", linuxEnvironment("NATS_TOKEN").value)
+}
+
+fun main: int {
+    var subscriber = natsAsyncClient(natsTestOptions())
+    var publisher = natsAsyncClient(natsTestOptions())
+    val eventsSid = subscriber.subscribe("events.>")
+    val limitedSid = subscriber.subscribe("limited")
+    subscriber.unsubscribe(limitedSid, 2)
+    val echoSid = subscriber.subscribe("service.echo")
+    // the subscriber must be open before the publisher's buffer flushes
+    var rounds = 0
+    while (!subscriber.isConnected() && rounds < 200) {
+        subscriber.step(10)
+        rounds = rounds + 1
+    }
+    if (!subscriber.isConnected()) return 10
+    if (!publisher.publish("events.a", "one") || !publisher.publish("events.b.c", "two")) return 20
+    publisher.publish("limited", "1")
+    publisher.publish("limited", "2")
+    publisher.publish("limited", "3")
+    val inbox = publisher.subscribe("_INBOX.async")
+    publisher.publish("service.echo", "ping", "_INBOX.async")
+
+    var events: array<string> = []
+    var limited = 0
+    var reply = ""
+    rounds = 0
+    while ((events.size < 2 || reply == "") && rounds < 300) {
+        subscriber.step(5)
+        publisher.step(5)
+        for (message in subscriber.takeMessages()) {
+            if (message.sid == eventsSid) events.append("${message.subject}=${message.payload}")
+            else if (message.sid == limitedSid) limited = limited + 1
+            else if (message.sid == echoSid) subscriber.publish(message.reply, "pong:${message.payload}")
+        }
+        for (message in publisher.takeMessages()) if (message.sid == inbox) reply = message.payload
+        rounds = rounds + 1
+    }
+    // let the third "limited" arrive if the limit were broken
+    rounds = 0
+    while (rounds < 20) {
+        subscriber.step(5)
+        for (message in subscriber.takeMessages()) if (message.sid == limitedSid) limited = limited + 1
+        rounds = rounds + 1
+    }
+    var connected = 0
+    for (event in subscriber.takeEvents()) if (event.kind == "connected") connected = connected + 1
+    subscriber.close()
+    publisher.close()
+
+    if (events.size != 2 || events[0] != "events.a=one" || events[1] != "events.b.c=two") 30
+    else if (limited != 2) 40
+    else if (reply != "pong:ping") 50
+    else if (connected != 1) 60
+    else 0
+}

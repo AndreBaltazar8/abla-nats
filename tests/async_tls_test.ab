@@ -1,0 +1,35 @@
+// natsAsyncClient over TLS (tools/test-async.sh runs a server with a throwaway
+// CA): the server requires TLS in its INFO and the client verifies it.
+
+import "abla/sys/linux/process"
+import "../src/async.ab"
+
+fun main: int {
+    val port = linuxEnvironment("NATS_TLS_PORT").value
+    val options = NatsAsyncOptions(["localhost:$port"], "tls-test", linuxEnvironment("NATS_TOKEN").value,
+        caPath = linuxEnvironment("NATS_CA").value)
+    var client = natsAsyncClient(options)
+    val sid = client.subscribe("secure.echo")
+    client.publish("secure.echo", "over tls")
+    var received = ""
+    val deadline = linuxMonotonicMilliseconds() + 10000
+    while (received == "" && linuxMonotonicMilliseconds() < deadline) {
+        client.step(10)
+        for (message in client.takeMessages()) if (message.sid == sid) received = message.payload
+    }
+    var errors = 0
+    for (event in client.takeEvents()) if (event.kind == "error") errors = errors + 1
+    client.close()
+
+    // the wrong CA must fail the handshake (OpenSSL verifies the peer during it), not connect
+    var untrusted = natsAsyncClient(NatsAsyncOptions(["localhost:$port"], "tls-test", linuxEnvironment("NATS_TOKEN").value,
+        caPath = linuxEnvironment("NATS_OTHER_CA").value, maximumReconnectAttempts = 0))
+    val until2 = linuxMonotonicMilliseconds() + 5000
+    while (!untrusted.isClosed() && linuxMonotonicMilliseconds() < until2) untrusted.step(10)
+    var verifyFailed = false
+    for (event in untrusted.takeEvents()) if (event.detail == "tls certificate verification failed" || event.detail == "tls handshake failed") verifyFailed = true
+    val wasConnected = untrusted.isConnected()
+    untrusted.close()
+
+    if (received != "over tls") 10 else if (errors != 0) 20 else if (!verifyFailed || wasConnected) 30 else 0
+}

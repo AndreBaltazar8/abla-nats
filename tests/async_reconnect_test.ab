@@ -1,0 +1,40 @@
+// tools/test-async.sh restarts the server while this runs: the subscriber
+// must see disconnected then reconnect, keep its subscription, and get a
+// message published after the restart.
+
+import "abla/sys/linux/process"
+import "../src/async.ab"
+
+fun natsTestOptions(): NatsAsyncOptions {
+    val port = linuxEnvironment("NATS_PORT")
+    NatsAsyncOptions(["127.0.0.1:${if (port.found) port.value else "4222"}"], "reconnect-test", linuxEnvironment("NATS_TOKEN").value,
+        reconnectWaitMilliseconds = 250)
+}
+
+fun main: int {
+    var subscriber = natsAsyncClient(natsTestOptions())
+    var publisher = natsAsyncClient(natsTestOptions())
+    val sid = subscriber.subscribe("after.restart")
+    var disconnected = false
+    var reconnected = false
+    var published = false
+    var received = ""
+    // 20s: the restart happens about 2s in
+    val deadline = linuxMonotonicMilliseconds() + 20000
+    while (received == "" && linuxMonotonicMilliseconds() < deadline) {
+        subscriber.step(5)
+        publisher.step(5)
+        for (event in subscriber.takeEvents()) {
+            if (event.kind == "disconnected") disconnected = true
+            if (event.kind == "reconnect") reconnected = true
+        }
+        publisher.takeEvents()
+        if (reconnected && !published && publisher.isConnected() && subscriber.isConnected()) {
+            published = publisher.publish("after.restart", "back")
+        }
+        for (message in subscriber.takeMessages()) if (message.sid == sid) received = message.payload
+    }
+    subscriber.close()
+    publisher.close()
+    if (!disconnected) 10 else if (!reconnected) 20 else if (received != "back") 30 else 0
+}

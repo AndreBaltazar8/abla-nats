@@ -1,0 +1,583 @@
+// Nonblocking Core NATS for event-loop services. step() drives the connect,
+// the optional TLS upgrade, CONNECT, writes and reads over one poller and
+// never blocks past its timeout; deliveries and connection events are taken
+// in batches. Subscriptions are replayed after a reconnect and publishes made
+// while disconnected are buffered (up to maximumPendingBytes).
+//
+//     val nats = natsAsyncClient(NatsAsyncOptions(["127.0.0.1:4222"], token = "t"))
+//     val sid = nats.subscribe("orders.>")
+//     nats.publish("orders.created", payload)
+//     ...each loop iteration:
+//     nats.step(0)
+//     for (message in nats.takeMessages()) handle(message)
+//
+// Servers are host:port, optionally prefixed with nats:// or tls:// (tls://
+// forces TLS). A server that requires TLS in its INFO is upgraded either way.
+
+import "abla/json"
+import "abla/text"
+import "abla/dns"
+import "abla/http/async"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+import "./nats.ab"
+
+class NatsAsyncOptions(
+    val servers: array<string> = ["127.0.0.1:4222"],
+    val name: string = "abla",
+    val token: string = "",
+    val username: string = "",
+    val password: string = "",
+    val tls: bool = false,
+    // TLS before the server's INFO (servers configured with handshake_first)
+    val tlsFirst: bool = false,
+    // Empty uses the system trust store.
+    val caPath: string = "",
+    val connectTimeoutMilliseconds: int = 3000,
+    val reconnectWaitMilliseconds: int = 2000,
+    // -1 retries forever
+    val maximumReconnectAttempts: int = -1,
+    val pingIntervalMilliseconds: int = 120000,
+    val maximumPingsOut: int = 2,
+    val maximumPendingBytes: int = 8388608
+)
+
+// kind: connecting | connected | disconnected | reconnect | refused | error | closed
+class NatsAsyncEvent(val kind: string, val detail: string)
+
+class NatsAsyncSubscription(val sid: int, val subject: string, val queue: string, var remaining: int)
+
+val natsAsyncIdle = 0
+val natsAsyncConnecting = 1
+val natsAsyncHandshaking = 2
+val natsAsyncAwaitingInfo = 3
+val natsAsyncAwaitingPong = 4
+val natsAsyncOpen = 5
+val natsAsyncClosed = 6
+
+resource class NatsAsyncClient(
+    val options: NatsAsyncOptions,
+    val poller: SocketPoller,
+    val reader: HttpAsyncRead,
+    var state: int,
+    var serverIndex: int,
+    var descriptor: int,
+    var sslContext: int,
+    var session: int,
+    var secure: bool,
+    var host: string,
+    // after the handshake: true sends CONNECT, false waits for INFO
+    var infoSeen: bool,
+    var output: string,
+    var outputOffset: int,
+    var pending: string,
+    var input: string,
+    var subscriptions: array<NatsAsyncSubscription>,
+    var nextSid: int,
+    var messages: array<NatsMessage>,
+    var events: array<NatsAsyncEvent>,
+    var everConnected: bool,
+    var attempts: int,
+    var retryAt: int,
+    var deadline: int,
+    var lastPingAt: int,
+    var pingsOut: int
+) {
+    trusted fun drop(): void {
+        if (this.session != 0) {
+            httpAsyncTlsFree(this.session)
+            this.session = 0
+        }
+        if (this.descriptor >= 0) {
+            linuxTcpCloseDescriptor(this.descriptor)
+            this.descriptor = -1
+        }
+        if (this.sslContext != 0) {
+            SSL_CTX_free(nativePointerFromAddress(this.sslContext))
+            this.sslContext = 0
+        }
+        this.poller.close()
+        return
+    }
+}
+
+fun natsAsyncClient(options: NatsAsyncOptions = NatsAsyncOptions()): NatsAsyncClient =
+    NatsAsyncClient(
+        options, socketPoller(), HttpAsyncRead("", 0), natsAsyncIdle, 0, -1, 0, 0,
+        false, "", false, "", 0, "", "", [], 1, [], [], false, 0, 0, 0, 0, 0
+    )
+
+fun natsAsyncNow(): int = linuxMonotonicMilliseconds()
+
+class NatsAsyncServer(val host: string, val port: int, val tls: bool)
+
+fun natsAsyncParseServer(server: string): NatsAsyncServer {
+    var text = server
+    var tls = false
+    if (text.size >= 6 && text.slice(0, 6) == "tls://") {
+        tls = true
+        text = text.slice(6, text.size)
+    } else if (text.size >= 7 && text.slice(0, 7) == "nats://") text = text.slice(7, text.size)
+    var colon = -1
+    var index = 0
+    while (index < text.size) {
+        if (text[index] == 58) colon = index
+        index = index + 1
+    }
+    if (colon < 0) NatsAsyncServer(text, 4222, tls)
+    else NatsAsyncServer(text.slice(0, colon), natsParseInt(text.slice(colon + 1, text.size), 4222), tls)
+}
+
+// An IPv4 address for the host ("" when it does not resolve). DNS is the
+// one blocking step, bounded by the connect timeout.
+fun natsAsyncResolve(host: string, timeoutMilliseconds: int): string {
+    val numeric = httpAsyncNumericIpv4(host)
+    if (numeric != "") return numeric
+    val resolved = dnsResolveType(host, 1, timeoutMilliseconds, "")
+    var address = ""
+    if (resolved.addresses.size > 0) address = resolved.addresses[0].address
+    address
+}
+
+fun NatsAsyncClient.event(kind: string, detail: string = ""): void {
+    this.events.append(NatsAsyncEvent(kind, detail))
+    return
+}
+
+fun NatsAsyncClient.interest(write: bool): void {
+    if (this.descriptor >= 0) this.poller.modifyDescriptor(this.descriptor, true, write)
+    return
+}
+
+fun NatsAsyncClient.closeSocket(): void {
+    if (this.session != 0) {
+        httpAsyncTlsFree(this.session)
+        this.session = 0
+    }
+    if (this.descriptor >= 0) {
+        this.poller.unwatchDescriptor(this.descriptor)
+        linuxTcpCloseDescriptor(this.descriptor)
+        this.descriptor = -1
+    }
+    this.output = ""
+    this.outputOffset = 0
+    this.input = ""
+    return
+}
+
+// Drops the connection; the next server is tried after the reconnect wait.
+fun NatsAsyncClient.fail(kind: string, detail: string): void {
+    val wasOpen = this.state == natsAsyncOpen
+    this.closeSocket()
+    if (wasOpen) this.event("disconnected", detail)
+    else this.event(kind, detail)
+    this.attempts = this.attempts + 1
+    this.serverIndex = this.serverIndex + 1
+    if (this.options.maximumReconnectAttempts >= 0 &&
+        this.attempts > this.options.maximumReconnectAttempts) {
+        this.state = natsAsyncClosed
+        this.event("closed", detail)
+    } else {
+        this.state = natsAsyncIdle
+        this.retryAt = natsAsyncNow() + (if (wasOpen) 0 else this.options.reconnectWaitMilliseconds)
+    }
+    return
+}
+
+fun NatsAsyncClient.startConnect(): void {
+    if (this.options.servers.size == 0) {
+        this.state = natsAsyncClosed
+        this.event("closed", "no NATS servers configured")
+        return
+    }
+    val server = natsAsyncParseServer(this.options.servers[this.serverIndex % this.options.servers.size])
+    this.event("connecting", "${server.host}:${server.port}")
+    this.host = server.host
+    this.secure = false
+    this.infoSeen = false
+    val address = natsAsyncResolve(server.host, this.options.connectTimeoutMilliseconds)
+    if (address == "") {
+        this.fail("error", "could not resolve ${server.host}")
+        return
+    }
+    val descriptor = httpAsyncConnect(address, server.port)
+    if (descriptor < 0) {
+        this.fail(if (descriptor == -111 || descriptor == -61) "refused" else "error", "connect failed (errno ${-descriptor})")
+        return
+    }
+    this.descriptor = descriptor
+    this.state = natsAsyncConnecting
+    this.deadline = natsAsyncNow() + this.options.connectTimeoutMilliseconds
+    this.poller.watchDescriptor(descriptor, true, true)
+    if (server.tls || this.options.tls) this.secure = true
+    return
+}
+
+fun NatsAsyncClient.beginTls(): void {
+    if (this.sslContext == 0) this.sslContext = httpAsyncTlsContext(this.options.caPath)
+    val session = if (this.sslContext == 0) 0 else httpAsyncTlsSession(this.sslContext, this.host, this.descriptor)
+    if (session == 0) {
+        this.fail("error", "tls setup failed")
+        return
+    }
+    this.session = session
+    this.state = natsAsyncHandshaking
+    this.handshake()
+    return
+}
+
+fun NatsAsyncClient.handshake(): void {
+    val result = httpAsyncTlsHandshake(this.session)
+    if (result == 1) {
+        if (this.infoSeen) this.sendConnect()
+        else {
+            this.state = natsAsyncAwaitingInfo
+            this.interest(false)
+        }
+    } else if (result == -2) this.interest(false)
+    else if (result == -3) this.interest(true)
+    else if (result == -100) this.fail("error", "tls certificate verification failed")
+    else this.fail("error", "tls handshake failed")
+    return
+}
+
+fun natsAsyncConnectPayload(options: NatsAsyncOptions): string {
+    val keys: array<string> = [
+        "verbose", "pedantic", "name", "lang", "version", "protocol", "echo", "headers", "no_responders"
+    ]
+    val values: array<Json> = [
+        jsonBoolean(false), jsonBoolean(false), jsonString(options.name),
+        jsonString("abla"), jsonString("0.2.0"), jsonInteger(1),
+        jsonBoolean(true), jsonBoolean(true), jsonBoolean(true)
+    ]
+    if (options.token != "") {
+        keys.append("auth_token")
+        values.append(jsonString(options.token))
+    }
+    if (options.username != "") {
+        keys.append("user")
+        values.append(jsonString(options.username))
+    }
+    if (options.password != "") {
+        keys.append("pass")
+        values.append(jsonString(options.password))
+    }
+    if (options.tls) {
+        keys.append("tls_required")
+        values.append(jsonBoolean(true))
+    }
+    jsonStringify(jsonObject(keys, values))
+}
+
+fun NatsAsyncClient.sendConnect(): void {
+    this.state = natsAsyncAwaitingPong
+    this.queueWrite("CONNECT ${natsAsyncConnectPayload(this.options)}\r\nPING\r\n")
+    return
+}
+
+// On the PONG for CONNECT: subscriptions replayed, then the buffered publishes.
+fun NatsAsyncClient.opened(): void {
+    this.state = natsAsyncOpen
+    this.event(if (this.everConnected) "reconnect" else "connected", this.host)
+    this.everConnected = true
+    this.attempts = 0
+    this.pingsOut = 0
+    this.lastPingAt = natsAsyncNow()
+    var replay = ""
+    for (subscription in this.subscriptions) {
+        replay = "$replay${natsAsyncSubLine(subscription)}"
+        if (subscription.remaining > 0) replay = "${replay}UNSUB ${subscription.sid} ${subscription.remaining}\r\n"
+    }
+    replay = "$replay${this.pending}"
+    this.pending = ""
+    if (replay != "") this.queueWrite(replay)
+    return
+}
+
+fun natsAsyncSubLine(subscription: NatsAsyncSubscription): string =
+    if (subscription.queue == "") "SUB ${subscription.subject} ${subscription.sid}\r\n"
+    else "SUB ${subscription.subject} ${subscription.queue} ${subscription.sid}\r\n"
+
+fun NatsAsyncClient.queueWrite(text: string): void {
+    this.output = if (this.output == "") text else "${this.output}$text"
+    this.writeReady()
+    return
+}
+
+fun NatsAsyncClient.writeReady(): void {
+    var writing = this.descriptor >= 0
+    while (writing) {
+        if (this.outputOffset >= this.output.size) {
+            this.output = ""
+            this.outputOffset = 0
+            this.interest(false)
+            writing = false
+        } else if (this.session != 0) {
+            val written = httpAsyncTlsWrite(this.session, this.output, this.outputOffset)
+            if (written > 0) this.outputOffset = this.outputOffset + written
+            else if (written == -3 || written == -2) {
+                this.interest(true)
+                writing = false
+            } else {
+                this.fail("error", "tls write failed")
+                writing = false
+            }
+        } else {
+            var connection = TcpConnection(this.descriptor)
+            val result = connection.writeCompact(this.output, this.outputOffset)
+            connection.descriptor = -1
+            if (result.written > 0) this.outputOffset = this.outputOffset + result.written
+            if (result.status == "error") {
+                if (result.errorCode == 11) this.interest(true)
+                else this.fail("error", "write failed")
+                writing = false
+            }
+        }
+    }
+    return
+}
+
+fun NatsAsyncClient.readReady(): void {
+    var reading = this.descriptor >= 0
+    while (reading) {
+        if (this.session != 0) httpAsyncTlsRead(this.session, this.reader)
+        else httpAsyncPlainRead(this.descriptor, this.reader)
+        val status = this.reader.status
+        val chunk = this.reader.text
+        this.reader.text = ""
+        if (status > 0) {
+            this.input = if (this.input == "") chunk else "${this.input}$chunk"
+            if (!this.parse()) reading = false
+        } else {
+            val wouldBlock = if (this.session != 0) status == -2 || status == -3 else status == -11
+            if (wouldBlock) {
+                if (this.session != 0 && status == -3) this.interest(true)
+            } else this.fail("error", "connection closed")
+            reading = false
+        }
+    }
+    return
+}
+
+// Consumes whole protocol frames from the input. False once the connection
+// was dropped or a TLS upgrade took over the socket.
+fun NatsAsyncClient.parse(): bool {
+    var going = true
+    while (going) {
+        var end = -1
+        var index = 0
+        while (end < 0 && index + 1 < this.input.size) {
+            if (this.input[index] == 13 && this.input[index + 1] == 10) end = index
+            index = index + 1
+        }
+        if (end < 0) return true
+        val line = this.input.slice(0, end)
+        val words = natsWords(line)
+        val operation = if (words.size > 0) words[0] else ""
+        if (operation == "MSG" || operation == "HMSG") {
+            val headerBytes = if (operation == "HMSG") natsParseInt(words[words.size - 2], -1) else 0
+            val totalBytes = natsParseInt(if (words.size > 0) words[words.size - 1] else "", -1)
+            val valid = if (operation == "MSG") words.size == 4 || words.size == 5
+                else words.size == 5 || words.size == 6
+            if (!valid || totalBytes < 0 || headerBytes < 0 || headerBytes > totalBytes || totalBytes > 16777216) {
+                this.fail("error", "NATS sent an invalid message frame")
+                return false
+            }
+            val begin = end + 2
+            if (this.input.size < begin + totalBytes + 2) return true
+            val hasReply = if (operation == "MSG") words.size == 5 else words.size == 6
+            val sid = natsParseInt(words[2])
+            this.messages.append(natsMessage(
+                "message", words[1], if (hasReply) words[3] else "",
+                this.input.slice(begin + headerBytes, begin + totalBytes),
+                this.input.slice(begin, begin + headerBytes), sid
+            ))
+            this.input = this.input.slice(begin + totalBytes + 2, this.input.size)
+            this.delivered(sid)
+        } else {
+            this.input = this.input.slice(end + 2, this.input.size)
+            if (operation == "PING") this.queueWrite("PONG\r\n")
+            else if (operation == "PONG") {
+                if (this.state == natsAsyncAwaitingPong) this.opened()
+                else this.pingsOut = 0
+            } else if (operation == "INFO") {
+                if (this.state == natsAsyncAwaitingInfo) {
+                    this.infoSeen = true
+                    val info = jsonParse(if (line.size > 5) line.slice(5, line.size) else "{}")
+                    val required = info.succeeded && info.value.get("tls_required").isBoolean() &&
+                        info.value.get("tls_required").asBoolean()
+                    if ((required || this.secure) && this.session == 0) {
+                        this.secure = true
+                        this.input = ""
+                        this.beginTls()
+                        return false
+                    }
+                    this.sendConnect()
+                }
+            } else if (operation == "-ERR") {
+                val detail = if (line.size > 5) line.slice(5, line.size) else line
+                this.event("error", detail)
+                if (this.state != natsAsyncOpen) {
+                    this.fail("error", detail)
+                    return false
+                }
+            } else if (operation != "+OK") {
+                this.fail("error", "NATS sent an unsupported protocol operation")
+                return false
+            }
+        }
+        going = this.descriptor >= 0
+    }
+    false
+}
+
+// A subscription with a delivery limit (unsubscribe(sid, maximum)) ends on its last message.
+fun NatsAsyncClient.delivered(sid: int): void {
+    var kept: array<NatsAsyncSubscription> = []
+    for (subscription in this.subscriptions) {
+        if (subscription.sid == sid && subscription.remaining > 0) {
+            if (subscription.remaining > 1) kept.append(NatsAsyncSubscription(sid, subscription.subject, subscription.queue, subscription.remaining - 1))
+        } else kept.append(NatsAsyncSubscription(subscription.sid, subscription.subject, subscription.queue, subscription.remaining))
+    }
+    this.subscriptions = kept
+    return
+}
+
+fun NatsAsyncClient.socketReady(readable: bool, writable: bool, failed: bool): void {
+    if (this.state == natsAsyncConnecting) {
+        if (writable || failed) {
+            val error = httpAsyncSocketError(this.descriptor)
+            if (error != 0) this.fail(if (error == 111 || error == 61) "refused" else "error", "connect failed (errno $error)")
+            else if (this.secure && this.options.tlsFirst) this.beginTls()
+            else {
+                this.state = natsAsyncAwaitingInfo
+                this.interest(false)
+            }
+        }
+    } else if (this.state == natsAsyncHandshaking) this.handshake()
+    else {
+        if (writable && this.output != "") this.writeReady()
+        if (this.descriptor >= 0 && (readable || failed || (this.session != 0 && writable))) this.readReady()
+    }
+    return
+}
+
+fun NatsAsyncClient.timers(now: int): void {
+    if (this.state == natsAsyncIdle && now >= this.retryAt) this.startConnect()
+    else if ((this.state == natsAsyncConnecting || this.state == natsAsyncHandshaking ||
+        this.state == natsAsyncAwaitingInfo || this.state == natsAsyncAwaitingPong) && now >= this.deadline) {
+        this.fail("error", "NATS connect timed out")
+    } else if (this.state == natsAsyncOpen && this.options.pingIntervalMilliseconds > 0 &&
+        now - this.lastPingAt >= this.options.pingIntervalMilliseconds) {
+        this.lastPingAt = now
+        if (this.pingsOut >= this.options.maximumPingsOut) this.fail("error", "stale connection")
+        else {
+            this.pingsOut = this.pingsOut + 1
+            this.queueWrite("PING\r\n")
+        }
+    }
+    return
+}
+
+// Progresses the connection for up to `timeoutMilliseconds` (0 never blocks).
+fun NatsAsyncClient.step(timeoutMilliseconds: int = 0): int {
+    this.timers(natsAsyncNow())
+    var timeout = timeoutMilliseconds
+    if (timeout < 0) timeout = 0
+    if (this.state == natsAsyncIdle || this.state == natsAsyncClosed || this.descriptor < 0) {
+        timeout = 0
+    }
+    val records = this.poller.waitCompact(64, timeout)
+    var handled = 0
+    var index = 0
+    while (index + 12 <= records.size) {
+        val flags = textReadU32LittleEndian(records, index)
+        val descriptor = textReadU32LittleEndian(records, index + 4)
+        if (descriptor == this.descriptor && descriptor >= 0) {
+            val readable = (flags & 1) != 0
+            val writable = (flags & 4) != 0
+            val failed = (flags & 8) != 0 || (flags & 16) != 0 || (flags & 8192) != 0
+            this.socketReady(readable, writable, failed)
+            handled = handled + 1
+        }
+        index = index + 12
+    }
+    this.timers(natsAsyncNow())
+    handled
+}
+
+// Buffered while disconnected; false when the subject or payload is invalid
+// or the pending buffer is full.
+fun NatsAsyncClient.publish(subject: string, payload: string, reply: string = ""): bool {
+    if (this.state == natsAsyncClosed) return false
+    if (!natsSubjectValid(subject, false) || (reply != "" && !natsSubjectValid(reply, false)) ||
+        payload.size > 16777216) return false
+    var command = "PUB $subject"
+    if (reply != "") command = "$command $reply"
+    command = "$command ${payload.size}\r\n$payload\r\n"
+    if (this.state == natsAsyncOpen) this.queueWrite(command)
+    else {
+        if (this.pending.size + command.size > this.options.maximumPendingBytes) return false
+        this.pending = "${this.pending}$command"
+    }
+    true
+}
+
+// 0 when the subject or queue is invalid.
+fun NatsAsyncClient.subscribe(subject: string, queue: string = ""): int {
+    if (this.state == natsAsyncClosed || !natsSubjectValid(subject, true) ||
+        (queue != "" && !natsSubjectValid(queue, false))) return 0
+    val sid = this.nextSid
+    this.nextSid = this.nextSid + 1
+    val subscription = NatsAsyncSubscription(sid, subject, queue, 0)
+    if (this.state == natsAsyncOpen) this.queueWrite(natsAsyncSubLine(subscription))
+    this.subscriptions.append(subscription)
+    sid
+}
+
+// maximum > 0 lets that many more messages through first.
+fun NatsAsyncClient.unsubscribe(sid: int, maximum: int = 0): bool {
+    var found = false
+    var kept: array<NatsAsyncSubscription> = []
+    for (subscription in this.subscriptions) {
+        if (subscription.sid == sid) {
+            found = true
+            if (maximum > 0) kept.append(NatsAsyncSubscription(sid, subscription.subject, subscription.queue, maximum))
+        } else kept.append(NatsAsyncSubscription(subscription.sid, subscription.subject, subscription.queue, subscription.remaining))
+    }
+    this.subscriptions = kept
+    if (found && this.state == natsAsyncOpen) {
+        this.queueWrite(if (maximum > 0) "UNSUB $sid $maximum\r\n" else "UNSUB $sid\r\n")
+    }
+    found
+}
+
+fun NatsAsyncClient.takeMessages(): array<NatsMessage> {
+    val taken: array<NatsMessage> = []
+    for (message in this.messages) taken.append(natsMessage(
+        message.kind, message.subject, message.reply, message.payload, message.headers, message.sid, message.error
+    ))
+    this.messages = []
+    taken
+}
+
+fun NatsAsyncClient.takeEvents(): array<NatsAsyncEvent> {
+    val taken: array<NatsAsyncEvent> = []
+    for (event in this.events) taken.append(NatsAsyncEvent(event.kind, event.detail))
+    this.events = []
+    taken
+}
+
+fun NatsAsyncClient.isConnected(): bool = this.state == natsAsyncOpen
+
+fun NatsAsyncClient.isClosed(): bool = this.state == natsAsyncClosed
+
+fun NatsAsyncClient.close(): void {
+    this.closeSocket()
+    if (this.state != natsAsyncClosed) this.event("closed", "")
+    this.state = natsAsyncClosed
+    return
+}
+
+// The poller descriptor; register it with another event loop to wake on traffic.
+fun NatsAsyncClient.pollDescriptor(): int = this.poller.descriptor

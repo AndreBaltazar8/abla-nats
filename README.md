@@ -14,7 +14,11 @@ client library or sidecar.
 - bounded connection, line, header, and payload reads;
 - subject validation and JSON-safe `CONNECT` generation;
 - Docker/Icy service-name resolution; and
-- environment and secret-file configuration.
+- environment and secret-file configuration; and
+- a nonblocking client for event loops (`src/async.ab`): poller-driven
+  connect, optional TLS (verified, upgraded when the server's INFO requires it
+  or `tls://`), reconnects across a server list with subscriptions replayed,
+  publishes buffered while disconnected, delivery limits, and pings.
 
 ## Import
 
@@ -43,7 +47,25 @@ fun main: int {
 }
 ```
 
-Publishing and request/reply use the same connection:
+For a service loop that must never block, use the async client:
+
+```abla
+import "../../abla-nats/src/async.ab"
+
+fun main: int {
+    var nats = natsAsyncClient(NatsAsyncOptions(["nats.internal:4222"], token = "secret"))
+    val sid = nats.subscribe("orders.>")
+    nats.publish("orders.created", "{}")
+    while (true) {
+        nats.step(50)
+        for (message in nats.takeMessages()) handleOrder(message)
+        for (event in nats.takeEvents()) logEvent(event.kind, event.detail)
+    }
+    0
+}
+```
+
+Publishing and request/reply on the blocking client use the same connection:
 
 ```abla
 val published = nats.publish("orders.created", payload)
@@ -69,13 +91,15 @@ publishing is required between the services.
 
 `make check` runs deterministic protocol fixtures. `make test` additionally
 starts a temporary `nats:2-alpine` server and verifies authentication,
-publish/subscribe, protocol flushing, and a complete request/reply exchange.
+publish/subscribe, protocol flushing, and a complete request/reply exchange;
+for the async client it also restarts the server mid-run (reconnect) and runs a
+TLS server with a throwaway CA (verification passes, a wrong CA is refused).
 
 ## Scope
 
-This is a Core NATS client on the direct Linux TCP backend. TLS, NKeys/JWT,
-JetStream management, reconnect server pools, and asynchronous dispatch are
-future layers. The parser already preserves headers and binary payloads for
+This is a Core NATS client on the direct Linux TCP backend. The blocking
+client is plain TCP; the async client adds TLS, reconnect server pools, and
+nonblocking dispatch. NKeys/JWT and JetStream management are future layers. The parser already preserves headers and binary payloads for
 those additions.
 
 Licensed under the Mozilla Public License 2.0.
