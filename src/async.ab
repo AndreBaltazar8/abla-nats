@@ -17,6 +17,7 @@
 import "abla/json"
 import "abla/text"
 import "abla/dns"
+import "abla/dns/async"
 import "abla/http/async"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
@@ -39,7 +40,9 @@ class NatsAsyncOptions(
     val maximumReconnectAttempts: int = -1,
     val pingIntervalMilliseconds: int = 120000,
     val maximumPingsOut: int = 2,
-    val maximumPendingBytes: int = 8388608
+    val maximumPendingBytes: int = 8388608,
+    // the DNS server for the hosts; empty reads /etc/resolv.conf
+    val dnsNameserver: string = ""
 )
 
 // kind: connecting | connected | disconnected | reconnect | refused | error | closed
@@ -54,6 +57,8 @@ val natsAsyncAwaitingInfo = 3
 val natsAsyncAwaitingPong = 4
 val natsAsyncOpen = 5
 val natsAsyncClosed = 6
+// waiting on the resolver for the server's address
+val natsAsyncResolving = 7
 
 resource class NatsAsyncClient(
     val options: NatsAsyncOptions,
@@ -81,7 +86,11 @@ resource class NatsAsyncClient(
     var retryAt: int,
     var deadline: int,
     var lastPingAt: int,
-    var pingsOut: int
+    var pingsOut: int,
+    val resolver: DnsAsyncResolver,
+    // the resolver query for the server being dialled (0 when none), and its port
+    var resolveId: int,
+    var resolvePort: int
 ) {
     trusted fun drop(): void {
         if (this.session != 0) {
@@ -96,6 +105,7 @@ resource class NatsAsyncClient(
             SSL_CTX_free(nativePointerFromAddress(this.sslContext))
             this.sslContext = 0
         }
+        this.resolver.close()
         this.poller.close()
         return
     }
@@ -104,7 +114,8 @@ resource class NatsAsyncClient(
 fun natsAsyncClient(options: NatsAsyncOptions = NatsAsyncOptions()): NatsAsyncClient =
     NatsAsyncClient(
         options, socketPoller(), HttpAsyncRead("", 0), natsAsyncIdle, 0, -1, 0, 0,
-        false, "", false, "", 0, "", "", [], 1, [], [], false, 0, 0, 0, 0, 0
+        false, "", false, "", 0, "", "", [], 1, [], [], false, 0, 0, 0, 0, 0,
+        dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = options.connectTimeoutMilliseconds, nameserver = options.dnsNameserver)), 0, 0
     )
 
 fun natsAsyncNow(): int = linuxMonotonicMilliseconds()
@@ -128,16 +139,6 @@ fun natsAsyncParseServer(server: string): NatsAsyncServer {
     else NatsAsyncServer(text.slice(0, colon), natsParseInt(text.slice(colon + 1, text.size), 4222), tls)
 }
 
-// An IPv4 address for the host ("" when it does not resolve). DNS is the
-// one blocking step, bounded by the connect timeout.
-fun natsAsyncResolve(host: string, timeoutMilliseconds: int): string {
-    val numeric = httpAsyncNumericIpv4(host)
-    if (numeric != "") return numeric
-    val resolved = dnsResolveType(host, 1, timeoutMilliseconds, "")
-    var address = ""
-    if (resolved.addresses.size > 0) address = resolved.addresses[0].address
-    address
-}
 
 fun NatsAsyncClient.event(kind: string, detail: string = ""): void {
     this.events.append(NatsAsyncEvent(kind, detail))
@@ -168,6 +169,10 @@ fun NatsAsyncClient.closeSocket(): void {
 // Drops the connection; the next server is tried after the reconnect wait.
 fun NatsAsyncClient.fail(kind: string, detail: string): void {
     val wasOpen = this.state == natsAsyncOpen
+    if (this.resolveId != 0) {
+        this.resolver.cancel(this.resolveId)
+        this.resolveId = 0
+    }
     this.closeSocket()
     if (wasOpen) this.event("disconnected", detail)
     else this.event(kind, detail)
@@ -195,12 +200,41 @@ fun NatsAsyncClient.startConnect(): void {
     this.host = server.host
     this.secure = false
     this.infoSeen = false
-    val address = natsAsyncResolve(server.host, this.options.connectTimeoutMilliseconds)
-    if (address == "") {
-        this.fail("error", "could not resolve ${server.host}")
+    if (server.tls || this.options.tls) this.secure = true
+    val numeric = httpAsyncNumericIpv4(server.host)
+    if (numeric != "") {
+        this.connectTo(numeric, server.port)
         return
     }
-    val descriptor = httpAsyncConnect(address, server.port)
+    // the resolver answers in step()
+    this.resolveId = this.resolver.start(server.host, 1)
+    this.resolvePort = server.port
+    this.state = natsAsyncResolving
+    this.resolved()
+    return
+}
+
+// the server's address once the resolver has it
+fun NatsAsyncClient.resolved(): void {
+    if (this.resolveId == 0 || !this.resolver.done(this.resolveId)) return
+    val result = this.resolver.take(this.resolveId)
+    this.resolveId = 0
+    var address = ""
+    var error = "no address"
+    if (result != null) {
+        if (result.resolution.addresses.size > 0) address = result.resolution.addresses[0].address
+        if (result.error != "") error = result.error
+    }
+    if (address == "") {
+        this.fail("error", "could not resolve ${this.host}: " + error)
+        return
+    }
+    this.connectTo(address, this.resolvePort)
+    return
+}
+
+fun NatsAsyncClient.connectTo(address: string, port: int): void {
+    val descriptor = httpAsyncConnect(address, port)
     if (descriptor < 0) {
         this.fail(if (descriptor == -111 || descriptor == -61) "refused" else "error", "connect failed (errno ${-descriptor})")
         return
@@ -209,7 +243,6 @@ fun NatsAsyncClient.startConnect(): void {
     this.state = natsAsyncConnecting
     this.deadline = natsAsyncNow() + this.options.connectTimeoutMilliseconds
     this.poller.watchDescriptor(descriptor, true, true)
-    if (server.tls || this.options.tls) this.secure = true
     return
 }
 
@@ -482,6 +515,13 @@ fun NatsAsyncClient.timers(now: int): void {
 // Progresses the connection for up to `timeoutMilliseconds` (0 never blocks).
 fun NatsAsyncClient.step(timeoutMilliseconds: int = 0): int {
     this.timers(natsAsyncNow())
+    if (this.state == natsAsyncResolving) {
+        // no socket yet: wait on the resolver instead
+        this.resolver.step(if (timeoutMilliseconds < 0) 0 else timeoutMilliseconds)
+        this.resolved()
+        this.timers(natsAsyncNow())
+        return 0
+    }
     var timeout = timeoutMilliseconds
     if (timeout < 0) timeout = 0
     if (this.state == natsAsyncIdle || this.state == natsAsyncClosed || this.descriptor < 0) {

@@ -59,4 +59,4 @@ done
 NATS_TLS_PORT="$tls_port" NATS_TOKEN="$token" NATS_CA="$certs/ca.pem" NATS_OTHER_CA="$certs/other.pem" \
     "$project_root/build/async-tls-test"
 
-printf '%s\n' 'NATS async buffering, replayed subscriptions, delivery limits, request/reply, reconnect, and TLS passed'
+printf '%s\n' 'NATS async buffering, replayed subscriptions, delivery limits, request/reply, nonblocking DNS, reconnect, and TLS passed'

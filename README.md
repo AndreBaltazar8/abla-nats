@@ -17,8 +17,9 @@ client library or sidecar.
 - environment and secret-file configuration; and
 - a nonblocking client for event loops (`src/async.ab`): poller-driven
   connect, optional TLS (verified, upgraded when the server's INFO requires it
-  or `tls://`), reconnects across a server list with subscriptions replayed,
-  publishes buffered while disconnected, delivery limits, and pings.
+  or `tls://`), hostnames resolved without blocking (`abla/dns/async`),
+  reconnects across a server list with subscriptions replayed, publishes
+  buffered while disconnected, delivery limits, and pings.
 
 ## Import
 
@@ -92,8 +93,10 @@ publishing is required between the services.
 `make check` runs deterministic protocol fixtures. `make test` additionally
 starts a temporary `nats:2-alpine` server and verifies authentication,
 publish/subscribe, protocol flushing, and a complete request/reply exchange;
-for the async client it also restarts the server mid-run (reconnect) and runs a
-TLS server with a throwaway CA (verification passes, a wrong CA is refused).
+for the async client it also restarts the server mid-run (reconnect), runs a
+TLS server with a throwaway CA (verification passes, a wrong CA is refused),
+and checks that a lookup against a nameserver that never answers leaves
+`step(0)` nonblocking and then times out.
 
 ## Scope
 

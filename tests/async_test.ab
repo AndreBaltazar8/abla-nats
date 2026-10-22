@@ -1,7 +1,9 @@
 // natsAsyncClient against a real server (tools/test-async.sh): publishes
 // buffered before the connection opens, subscriptions made before it opens,
-// a queue-less fan-out, delivery limits and request/reply.
+// a queue-less fan-out, delivery limits and request/reply, and a server whose
+// name never resolves leaving step(0) nonblocking.
 
+import "abla/text"
 import "abla/sys/linux/process"
 import "../src/async.ab"
 
@@ -58,9 +60,29 @@ fun main: int {
     subscriber.close()
     publisher.close()
 
-    if (events.size != 2 || events[0] != "events.a=one" || events[1] != "events.b.c=two") 30
-    else if (limited != 2) 40
-    else if (reply != "pong:ping") 50
-    else if (connected != 1) 60
-    else 0
+    if (events.size != 2 || events[0] != "events.a=one" || events[1] != "events.b.c=two") return 30
+    if (limited != 2) return 40
+    if (reply != "pong:ping") return 50
+    if (connected != 1) return 60
+
+    // a nameserver that never answers: step(0) stays nonblocking, then the
+    // lookup times out
+    var lost = natsAsyncClient(NatsAsyncOptions(["nats://nats.example.invalid:4222"], "lost", connectTimeoutMilliseconds = 1500,
+        maximumReconnectAttempts = 0, dnsNameserver = "10.255.255.1"))
+    lost.publish("x", "y")
+    val before = linuxMonotonicMilliseconds()
+    var spins = 0
+    while (spins < 100) {
+        lost.step(0)
+        spins = spins + 1
+    }
+    if (linuxMonotonicMilliseconds() - before > 200) return 70
+    var resolveError = ""
+    val lostDeadline = linuxMonotonicMilliseconds() + 5000
+    while (resolveError == "" && linuxMonotonicMilliseconds() < lostDeadline) {
+        lost.step(50)
+        for (event in lost.takeEvents()) if (event.detail.contains("could not resolve")) resolveError = event.detail
+    }
+    lost.close()
+    if (!resolveError.contains("dns timeout")) 71 else 0
 }
