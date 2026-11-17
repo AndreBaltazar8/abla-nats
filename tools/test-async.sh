@@ -15,7 +15,17 @@ cleanup() {
 trap cleanup EXIT
 
 # a fixed host port, so the restart below keeps it
-port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+# A port nobody listens on (a connect is refused), below the ephemeral range; a published port of a running container counts as taken.
+free_port() {
+    local candidate
+    for _ in $(seq 100); do
+        candidate=$((20000 + RANDOM % 10000))
+        (exec 3<> "/dev/tcp/127.0.0.1/$candidate") 2> /dev/null || { echo "$candidate"; return 0; }
+    done
+    echo "no free port" >&2
+    return 1
+}
+port=$(free_port)
 docker run --detach --name "$container" --publish "127.0.0.1:$port:4222" \
     nats:2-alpine --auth "$token" >/dev/null
 wait_ready() {
@@ -48,7 +58,7 @@ printf 'subjectAltName=DNS:localhost\n' > "$certs/san.ext"
 openssl x509 -req -in "$certs/server.csr" -CA "$certs/ca.pem" -CAkey "$certs/ca.key" -CAcreateserial \
     -days 1 -extfile "$certs/san.ext" -out "$certs/server.pem" 2>/dev/null
 chmod 644 "$certs"/*
-tls_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+tls_port=$(free_port)
 docker run --rm --detach --name "$container-tls" --publish "127.0.0.1:$tls_port:4222" -v "$certs:/certs:ro" \
     nats:2-alpine --auth "$token" --tls --tlscert /certs/server.pem --tlskey /certs/server.key >/dev/null
 for _ in $(seq 1 50); do
