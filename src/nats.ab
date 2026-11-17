@@ -3,6 +3,7 @@
 import "abla/json"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
+import "abla/sys/linux"
 
 class NatsConfig(
     val host: string,

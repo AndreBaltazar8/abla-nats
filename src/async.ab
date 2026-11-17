@@ -22,6 +22,7 @@ import "abla/http/async"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "./nats.ab"
+import "abla/unsafe/memory/raw"
 
 class NatsAsyncOptions(
     val servers: array<string> = ["127.0.0.1:4222"],
