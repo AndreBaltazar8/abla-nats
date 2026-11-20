@@ -16,7 +16,6 @@
 
 import "abla/json"
 import "abla/text"
-import "abla/dns"
 import "abla/dns/async"
 import "abla/http/async"
 import "abla/tls/pure"
