@@ -252,7 +252,7 @@ fun NatsAsyncClient.beginTls(): void {
         this.fail("error", "tls setup failed")
         return
     }
-    this.tls = session
+    this.tls = move(session)
     this.session = 1
     this.state = natsAsyncHandshaking
     this.handshake()
