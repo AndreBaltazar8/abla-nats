@@ -93,7 +93,7 @@ resource class NatsAsyncClient(
     var resolveId: int,
     var resolvePort: int
 ) {
-    trusted fun drop(): void {
+    fun drop(): void {
         if (this.session != 0) {
             this.tls.close()
             this.session = 0
