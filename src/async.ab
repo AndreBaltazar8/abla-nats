@@ -423,6 +423,9 @@ fun NatsAsyncClient.readReady(): void {
     return
 }
 
+// The longest protocol line (INFO, MSG, PING...) the client waits for the end of: 1 MiB, past any server's INFO.
+val natsAsyncMaximumControlLine = 1048576
+
 // Consumes whole protocol frames from the input. False once the connection
 // was dropped or a TLS upgrade took over the socket.
 fun NatsAsyncClient.parse(): bool {
@@ -434,7 +437,15 @@ fun NatsAsyncClient.parse(): bool {
             if (this.input[index] == 13 && this.input[index + 1] == 10) end = index
             index = index + 1
         }
-        if (end < 0) return true
+        if (end < 0) {
+            // An unfinished protocol line is all the input holds: past the bound, the server is never going to finish it.
+            if (this.input.size > natsAsyncMaximumControlLine) {
+                this.input = ""
+                this.fail("error", "NATS sent a protocol line over $natsAsyncMaximumControlLine bytes")
+                return false
+            }
+            return true
+        }
         val line = this.input.slice(0, end)
         val words = natsWords(line)
         val operation = if (words.size > 0) words[0] else ""

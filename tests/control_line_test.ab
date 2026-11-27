@@ -1,0 +1,91 @@
+import "../src/async.ab"
+import "../src/nats.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+
+// A server that never ends a protocol line (an INFO that goes on for ever) fails the connection once the line passes
+// natsAsyncMaximumControlLine, instead of the client buffering it without bound. A long line within the bound still parses.
+// The server is this program run again as a child.
+
+trusted fun server(mode: string): int {
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val peer=listener.accept()
+    if(mode=="long") {
+        // a 512 KiB INFO, then the CONNECT's PONG
+        peer.write("INFO {\"server_name\":\"${"x".repeat(524288)}\"}\r\n")
+        peer.readWithTimeoutResult(65536,2000)
+        peer.write("PONG\r\n")
+        sleep(2000)
+    } else {
+        peer.write("INFO {\"server_name\":\"")
+        var sending=true
+        while(sending) if(peer.write("x".repeat(65536))<0) sending=false
+    }
+    0
+}
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+class Running(val process: int, val port: int, val ready: string)
+
+trusted fun startServer(mode: string): Running {
+    val parent=linuxProcessId()
+    val ready="build/control-line-$mode-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("server").argument(mode).output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=natsParseInt(linuxReadFile(ready,64).trim(),0); if(port<=0) sleep(5) }
+    check("server $mode started",port>0)
+    Running(child.process,port,ready)
+}
+
+trusted fun stopServer(server: Running): void {
+    linuxSyscall2(62,server.process,9)
+    linuxWaitProcess(server.process)
+    Path(server.ready).remove()
+    return
+}
+
+trusted fun main: int {
+    if(linuxArgument(0)=="server") return server(linuxArgument(1))
+    val endless=startServer("endless")
+    if(endless.port>0) {
+        var client=natsAsyncClient(NatsAsyncOptions(["nats://127.0.0.1:${endless.port}"],maximumReconnectAttempts=0))
+        var detail=""
+        var largest=0
+        val deadline=linuxMonotonicMilliseconds()+10000
+        while(detail=="" && linuxMonotonicMilliseconds()<deadline) {
+            client.step(10)
+            if(client.input.size>largest) largest=client.input.size
+            for(event in client.takeEvents()) if(event.kind=="error" || event.kind=="closed") detail=event.detail
+        }
+        check("an endless protocol line fails the connection: $detail",detail.contains("protocol line over"))
+        check("and is never buffered far past the bound: $largest",largest<=natsAsyncMaximumControlLine+1048576)
+    }
+    stopServer(endless)
+    val long=startServer("long")
+    if(long.port>0) {
+        var client=natsAsyncClient(NatsAsyncOptions(["nats://127.0.0.1:${long.port}"],maximumReconnectAttempts=0))
+        val deadline=linuxMonotonicMilliseconds()+5000
+        while(!client.isConnected() && !client.isClosed() && linuxMonotonicMilliseconds()<deadline) client.step(10)
+        check("a 512 KiB INFO within the bound still connects",client.isConnected())
+    }
+    stopServer(long)
+    if(failures==0) println("ok control line")
+    if(failures==0) 0 else 1
+}
