@@ -1,0 +1,75 @@
+import "../src/async.ab"
+import "../src/nats.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+
+// A server that never stops sending (MSG after MSG) cannot keep step() from returning or pile up messages without bound in one step:
+// each step reads at most natsAsyncReadBudget (plus one more when the last read stopped at it), and the rest arrives in later steps.
+// The server is this program run again as a child.
+
+trusted fun server(): int {
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val peer=listener.accept()
+    peer.write("INFO {\"server_name\":\"flood\"}\r\n")
+    peer.readWithTimeoutResult(65536,2000)
+    peer.write("PONG\r\n")
+    val burst="MSG flood 1 3\r\nabc\r\n".repeat(4096)
+    var sending=true
+    while(sending) if(peer.write(burst)<0) sending=false
+    0
+}
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+trusted fun main: int {
+    if(linuxArgument(0)=="server") return server()
+    val parent=linuxProcessId()
+    val ready="build/read-budget-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("server").output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=natsParseInt(linuxReadFile(ready,64).trim(),0); if(port<=0) sleep(5) }
+    check("server started",port>0)
+    if(port>0) {
+        var client=natsAsyncClient(NatsAsyncOptions(["nats://127.0.0.1:$port"],maximumReconnectAttempts=0))
+        client.subscribe("flood")
+        val connectDeadline=linuxMonotonicMilliseconds()+3000
+        while(!client.isConnected() && linuxMonotonicMilliseconds()<connectDeadline) client.step(10)
+        check("connected",client.isConnected())
+        var steps=0
+        var most=0
+        var total=0
+        val deadline=linuxMonotonicMilliseconds()+10000
+        while(steps<30 && linuxMonotonicMilliseconds()<deadline) {
+            client.step(0)
+            val taken=client.takeMessages().size
+            if(taken>most) most=taken
+            total=total+taken
+            steps=steps+1
+        }
+        // A message is 20 bytes on the wire; a read can pass the budget by one chunk (64 KiB), and a step makes at most two reads.
+        check("30 steps return while the server floods: $steps",steps==30)
+        check("messages keep arriving: $total",total>30000)
+        check("no step takes more than two read budgets of messages: $most",most<=2*(natsAsyncReadBudget+65536)/20+1)
+    }
+    linuxSyscall2(62,child.process,9)
+    linuxWaitProcess(child.process)
+    Path(ready).remove()
+    if(failures==0) println("ok read budget")
+    if(failures==0) 0 else 1
+}

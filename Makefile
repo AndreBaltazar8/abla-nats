@@ -9,6 +9,8 @@ check:
 	build/protocol-test
 	$(COMPILER) build tests/control_line_test.ab -o build/control-line-test --fast --no-cache
 	build/control-line-test
+	$(COMPILER) build tests/read_budget_test.ab -o build/read-budget-test --fast --no-cache
+	build/read-budget-test
 
 test: check
 	ABLAC=$(COMPILER) ./tools/test-nats.sh

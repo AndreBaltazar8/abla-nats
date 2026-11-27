@@ -91,7 +91,10 @@ resource class NatsAsyncClient(
     val resolver: DnsAsyncResolver,
     // the resolver query for the server being dialled (0 when none), and its port
     var resolveId: int,
-    var resolvePort: int
+    var resolvePort: int,
+    // readReady stopped at its per-call budget with input maybe still waiting (in the socket or a TLS record): the next step reads
+    // again before it waits
+    var readPending: bool = false
 ) {
     fun drop(): void {
         if (this.session != 0) {
@@ -148,6 +151,7 @@ fun NatsAsyncClient.interest(write: bool): void {
 }
 
 fun NatsAsyncClient.closeSocket(): void {
+    this.readPending = false
     if (this.session != 0) {
         this.tls.close()
         this.session = 0
@@ -401,15 +405,26 @@ fun NatsAsyncClient.writeReady(): void {
     return
 }
 
+// The bytes one readReady takes before it hands control back to step(): a server that never stops sending cannot keep step() from
+// returning, or pile up messages without bound in one call.
+val natsAsyncReadBudget = 1048576
+
 fun NatsAsyncClient.readReady(): void {
     var reading = this.descriptor >= 0
+    var taken = 0
+    this.readPending = false
     while (reading) {
+        if (taken >= natsAsyncReadBudget) {
+            this.readPending = true
+            return
+        }
         if (this.session != 0) this.tlsRead()
         else httpAsyncPlainRead(this.descriptor, this.reader)
         val status = this.reader.status
         val chunk = this.reader.text
         this.reader.text = ""
         if (status > 0) {
+            taken = taken + chunk.size
             this.input = if (this.input == "") chunk else "${this.input}$chunk"
             if (!this.parse()) reading = false
         } else {
@@ -429,24 +444,28 @@ val natsAsyncMaximumControlLine = 1048576
 // Consumes whole protocol frames from the input. False once the connection
 // was dropped or a TLS upgrade took over the socket.
 fun NatsAsyncClient.parse(): bool {
+    // Frames are consumed by moving `at`; the input is cut once, when parsing stops for more bytes (a cut per frame copied the rest of
+    // the input each time: quadratic in a read of many small messages).
+    var at = 0
     var going = true
     while (going) {
         var end = -1
-        var index = 0
+        var index = at
         while (end < 0 && index + 1 < this.input.size) {
             if (this.input[index] == 13 && this.input[index + 1] == 10) end = index
             index = index + 1
         }
         if (end < 0) {
             // An unfinished protocol line is all the input holds: past the bound, the server is never going to finish it.
-            if (this.input.size > natsAsyncMaximumControlLine) {
+            if (this.input.size - at > natsAsyncMaximumControlLine) {
                 this.input = ""
                 this.fail("error", "NATS sent a protocol line over $natsAsyncMaximumControlLine bytes")
                 return false
             }
+            this.input = this.input.slice(at, this.input.size)
             return true
         }
-        val line = this.input.slice(0, end)
+        val line = this.input.slice(at, end)
         val words = natsWords(line)
         val operation = if (words.size > 0) words[0] else ""
         if (operation == "MSG" || operation == "HMSG") {
@@ -459,7 +478,10 @@ fun NatsAsyncClient.parse(): bool {
                 return false
             }
             val begin = end + 2
-            if (this.input.size < begin + totalBytes + 2) return true
+            if (this.input.size < begin + totalBytes + 2) {
+                this.input = this.input.slice(at, this.input.size)
+                return true
+            }
             val hasReply = if (operation == "MSG") words.size == 5 else words.size == 6
             val sid = natsParseInt(words[2])
             this.messages.append(natsMessage(
@@ -467,10 +489,10 @@ fun NatsAsyncClient.parse(): bool {
                 this.input.slice(begin + headerBytes, begin + totalBytes),
                 this.input.slice(begin, begin + headerBytes), sid
             ))
-            this.input = this.input.slice(begin + totalBytes + 2, this.input.size)
+            at = begin + totalBytes + 2
             this.delivered(sid)
         } else {
-            this.input = this.input.slice(end + 2, this.input.size)
+            at = end + 2
             if (operation == "PING") this.queueWrite("PONG\r\n")
             else if (operation == "PONG") {
                 if (this.state == natsAsyncAwaitingPong) this.opened()
@@ -569,6 +591,9 @@ fun NatsAsyncClient.step(timeoutMilliseconds: int = 0): int {
     if (this.state == natsAsyncIdle || this.state == natsAsyncClosed || this.descriptor < 0) {
         timeout = 0
     }
+    // Input left by the last read's budget is read now, without waiting: bytes a TLS record already holds raise no readiness event.
+    val pending = this.readPending && this.descriptor >= 0
+    if (pending) timeout = 0
     val records = this.poller.waitCompact(64, timeout)
     var handled = 0
     var index = 0
@@ -583,6 +608,10 @@ fun NatsAsyncClient.step(timeoutMilliseconds: int = 0): int {
             handled = handled + 1
         }
         index = index + 12
+    }
+    if (pending && this.readPending && this.descriptor >= 0) {
+        this.readReady()
+        handled = handled + 1
     }
     this.timers(natsAsyncNow())
     handled
